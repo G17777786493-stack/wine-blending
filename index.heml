@@ -1,0 +1,892 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { Wine, Settings, TrendingUp, CheckCircle, RotateCcw, AlertCircle, PieChart as PieChartIcon, Users, UserCheck, Trash2, Plus, Target, Map, Undo2, Save } from 'lucide-react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
+
+const WINE_COLORS = ['#722F37', '#9E4244', '#C95A62', '#E18289', '#F0B1B6'];
+const SAVE_KEY = 'wine_blend_system_save';
+
+export default function App() {
+  const [loaded, setLoaded] = useState(false);
+
+  // --- 状态定义 ---
+  const [numWines, setNumWines] = useState(3);
+  const [baseWines, setBaseWines] = useState([
+    { id: 0, name: '酒样 1 号', year: '', tag: '', min: '', max: '' },
+    { id: 1, name: '酒样 2 号', year: '', tag: '', min: '', max: '' },
+    { id: 2, name: '酒样 3 号', year: '', tag: '', min: '', max: '' },
+  ]);
+
+  const [roles, setRoles] = useState([
+    { id: 'r1', name: '调配师', count: 1, weight: 60 },
+    { id: 'r2', name: '品鉴员', count: 2, weight: 40 }
+  ]);
+
+  const [iteration, setIteration] = useState(1);
+  const [currentRaterIndex, setCurrentRaterIndex] = useState(0); 
+  const [roundScores, setRoundScores] = useState([]); 
+  const [scores, setScores] = useState({ appearance: 2.5, aroma: 4.5, taste: 4.0, aftertaste: 2.0, overall: 1.5 });
+  
+  const [history, setHistory] = useState([]);
+  const [currentRecipe, setCurrentRecipe] = useState([100, 0, 0]); 
+  
+  const [isConverged, setIsConverged] = useState(false);
+  const [maxScore, setMaxScore] = useState(0);
+  const [bestRecipe, setBestRecipe] = useState([]);
+  const [spaceDistance, setSpaceDistance] = useState(100); 
+  const [failCount, setFailCount] = useState(0); 
+
+  // 撤销栈
+  const [undoStack, setUndoStack] = useState([]);
+  
+  const [targetVolume, setTargetVolume] = useState(500);
+
+  // --- LocalStorage 数据持久化 ---
+  useEffect(() => {
+    const saved = localStorage.getItem(SAVE_KEY);
+    if (saved) {
+      try {
+        const data = JSON.parse(saved);
+        setNumWines(data.numWines || 3);
+        setBaseWines(data.baseWines || []);
+        setRoles(data.roles || []);
+        setIteration(data.iteration || 1);
+        setCurrentRaterIndex(data.currentRaterIndex || 0);
+        setRoundScores(data.roundScores || []);
+        setHistory(data.history || []);
+        setCurrentRecipe(data.currentRecipe || []);
+        setIsConverged(data.isConverged || false);
+        setMaxScore(data.maxScore || 0);
+        setBestRecipe(data.bestRecipe || []);
+        setSpaceDistance(data.spaceDistance || 100);
+        setFailCount(data.failCount || 0);
+        setUndoStack(data.undoStack || []);
+      } catch(e) { console.error("加载存档失败"); }
+    }
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (loaded) {
+      localStorage.setItem(SAVE_KEY, JSON.stringify({
+        numWines, baseWines, roles, iteration, currentRaterIndex,
+        roundScores, history, currentRecipe, isConverged,
+        maxScore, bestRecipe, spaceDistance, failCount, undoStack
+      }));
+    }
+  }, [loaded, numWines, baseWines, roles, iteration, currentRaterIndex, roundScores, history, currentRecipe, isConverged, maxScore, bestRecipe, spaceDistance, failCount, undoStack]);
+
+
+  // --- 衍生状态与计算 ---
+  const raters = useMemo(() => {
+    let list = [];
+    roles.forEach(role => {
+      for(let i=0; i<role.count; i++) {
+        list.push({ id: `${role.id}_${i}`, roleId: role.id, roleName: role.name, name: `${role.name} ${i+1}` });
+      }
+    });
+    return list;
+  }, [roles]);
+
+  const activeTotalWeight = roles.filter(r => r.count > 0).reduce((sum, r) => sum + (Number(r.weight) || 0), 0);
+  const isWeightValid = activeTotalWeight === 100;
+
+  // 验证边界约束是否合规
+  const boundsStatus = useMemo(() => {
+    let sumMin = 0;
+    let sumMax = 0;
+    let valid = true;
+    baseWines.forEach(w => {
+      const min = w.min === '' ? 0 : Number(w.min);
+      const max = w.max === '' ? 100 : Number(w.max);
+      sumMin += min;
+      sumMax += max;
+      if (min > max || min < 0 || max > 100) valid = false;
+    });
+    if (sumMin > 100 || sumMax < 100) valid = false;
+    return { valid, sumMin, sumMax };
+  }, [baseWines]);
+
+  // 约束投影引擎：将任何越界的点“拍回”合规空间内
+  const projectToConstraints = (recipe, bounds) => {
+    let r = [...recipe];
+    let num = r.length;
+    for (let iter = 0; iter < 50; iter++) {
+      let sum = 0;
+      for (let i = 0; i < num; i++) {
+        if (r[i] < bounds[i].min) r[i] = bounds[i].min;
+        if (r[i] > bounds[i].max) r[i] = bounds[i].max;
+        sum += r[i];
+      }
+      let diff = sum - 100;
+      if (Math.abs(diff) < 0.001) break;
+
+      if (diff > 0) { // 总和超了，削减那些大于 min 的项
+        let adjustable = r.reduce((acc, val, i) => acc + (val > bounds[i].min ? val : 0), 0);
+        if (adjustable === 0) break;
+        for (let i = 0; i < num; i++) {
+          if (r[i] > bounds[i].min) {
+            let amount = diff * (r[i] / adjustable);
+            r[i] = Math.max(bounds[i].min, r[i] - amount);
+          }
+        }
+      } else { // 总和不够，增加那些小于 max 的项
+        let deficit = 100 - sum;
+        let adjustable = r.reduce((acc, val, i) => acc + (val < bounds[i].max ? 100 - val : 0), 0);
+        if (adjustable === 0) break;
+        for (let i = 0; i < num; i++) {
+          if (r[i] < bounds[i].max) {
+            let amount = deficit * ((100 - r[i]) / adjustable);
+            r[i] = Math.min(bounds[i].max, r[i] + amount);
+          }
+        }
+      }
+    }
+    return r;
+  };
+
+  // 动态生成“简化单纯形-重心设计” (D-Optimal 思想，高维裁剪)
+  const predefinedRecipes = useMemo(() => {
+    if (!boundsStatus.valid) return [];
+    const bounds = baseWines.map(w => ({
+      min: w.min === '' ? 0 : Number(w.min),
+      max: w.max === '' ? 100 : Number(w.max)
+    }));
+
+    let recipes = [];
+    // 1. 顶点投影
+    for (let i = 0; i < numWines; i++) {
+      let r = Array(numWines).fill(0);
+      r[i] = 100;
+      recipes.push(projectToConstraints(r, bounds));
+    }
+    // 2. 中心点投影
+    recipes.push(projectToConstraints(Array(numWines).fill(100 / numWines), bounds));
+
+    // 3. 边界点：当且仅当基酒 <= 3 时，才生成边界以防“摸底灾难”
+    if (numWines === 3) {
+      for (let i = 0; i < numWines; i++) {
+        for (let j = i + 1; j < numWines; j++) {
+          let r = Array(numWines).fill(0);
+          r[i] = 50; r[j] = 50;
+          recipes.push(projectToConstraints(r, bounds));
+        }
+      }
+    }
+
+    // 去重 (因为投影可能导致不同初始点坍塌为同一点)
+    let unique = [];
+    for (let r of recipes) {
+      if (!unique.some(u => {
+        let diff = 0;
+        for(let k=0; k<numWines; k++) diff += Math.abs(u[k] - r[k]);
+        return diff < 1.0;
+      })) {
+        unique.push(r);
+      }
+    }
+    return unique;
+  }, [numWines, baseWines, boundsStatus]);
+
+
+  // --- 交互操作逻辑 ---
+  useEffect(() => {
+    if (loaded && iteration === 1 && predefinedRecipes.length > 0 && !history.length) {
+       setCurrentRecipe(predefinedRecipes[0]);
+    }
+  }, [numWines, predefinedRecipes, loaded, iteration, history.length]);
+
+  const handleNumWinesChange = (val) => {
+    setNumWines(val);
+    const newWines = Array.from({ length: val }, (_, i) => ({
+      id: i, name: `酒样 ${i + 1} 号`, year: '', tag: '', min: '', max: ''
+    }));
+    setBaseWines(newWines);
+    handleReset(val, newWines);
+  };
+
+  const currentTotalScore = Number((scores.appearance + scores.aroma + scores.taste + scores.aftertaste + scores.overall).toFixed(1));
+
+  const handleReset = (num = numWines, wines = baseWines) => {
+    setIteration(1);
+    setHistory([]);
+    setIsConverged(false);
+    setMaxScore(0);
+    setSpaceDistance(100);
+    setFailCount(0);
+    setCurrentRaterIndex(0);
+    setRoundScores([]);
+    setUndoStack([]);
+    
+    let initialRecipe = Array(num).fill(0);
+    initialRecipe[0] = 100;
+    setCurrentRecipe(initialRecipe);
+    setScores({ appearance: 2.5, aroma: 4.5, taste: 4.0, aftertaste: 2.0, overall: 1.5 });
+  };
+
+  const handleUndo = () => {
+    if (currentRaterIndex > 0) {
+      // 级别1：撤销正在打分的当前人
+      setCurrentRaterIndex(prev => prev - 1);
+      setRoundScores(prev => prev.slice(0, -1));
+    } else if (undoStack.length > 0) {
+      // 级别2：撤销上一整轮
+      const prev = undoStack[undoStack.length - 1];
+      setUndoStack(stack => stack.slice(0, -1));
+      setHistory(prev.history);
+      setIteration(prev.iteration);
+      setCurrentRecipe(prev.currentRecipe);
+      setIsConverged(prev.isConverged);
+      setMaxScore(prev.maxScore);
+      setBestRecipe(prev.bestRecipe);
+      setSpaceDistance(prev.spaceDistance);
+      setFailCount(prev.failCount);
+      setRoundScores([]);
+      setCurrentRaterIndex(0);
+    }
+  };
+
+  const generateNextRecipe = (currentHistory, num, currentFailCount = 0) => {
+    if (currentHistory.length < predefinedRecipes.length) {
+      return [...predefinedRecipes[currentHistory.length]];
+    }
+    
+    const bounds = baseWines.map(w => ({
+      min: w.min === '' ? 0 : Number(w.min),
+      max: w.max === '' ? 100 : Number(w.max)
+    }));
+
+    const sortedBest = [...currentHistory].sort((a, b) => {
+      if (Math.abs(b.score - a.score) > 0.001) return b.score - a.score;
+      return b.iteration - a.iteration; 
+    }).slice(0, num);
+    
+    const worst = sortedBest[num - 1].recipe;
+    const best = sortedBest[0].recipe;
+    
+    let centroid = Array(num).fill(0);
+    for (let i = 0; i < num - 1; i++) {
+      for (let j = 0; j < num; j++) {
+        centroid[j] += sortedBest[i].recipe[j] / (num - 1);
+      }
+    }
+    
+    let reflected = Array(num).fill(0);
+    for (let j = 0; j < num; j++) {
+      reflected[j] = centroid[j] + 1.2 * (centroid[j] - worst[j]); 
+    }
+    reflected = projectToConstraints(reflected, bounds);
+    
+    let sum = reflected.reduce((a,b)=>a+b,0);
+    let isOutOfBounds = sum === 0; 
+    let forceContraction = currentFailCount >= 2;
+
+    if (isOutOfBounds || forceContraction) {
+      sum = 0;
+      for (let j = 0; j < num; j++) {
+        reflected[j] = best[j] + 0.5 * (worst[j] - best[j]);
+      }
+      reflected = projectToConstraints(reflected, bounds);
+    }
+
+    let finalRecipe = [...reflected];
+
+    let attempt = 0;
+    while (attempt < 15) {
+      let isDuplicate = currentHistory.some(h => {
+        let diff = 0;
+        for (let k = 0; k < num; k++) diff += Math.abs(h.recipe[k] - finalRecipe[k]);
+        return diff < 1.0; 
+      });
+
+      if (!isDuplicate) break; 
+
+      let swing = 25 / (currentFailCount + 1 + attempt * 0.5); 
+      let perturbed = Array(num).fill(0);
+      for (let k = 0; k < num; k++) {
+        perturbed[k] = best[k] + (Math.random() * swing - swing/2);
+      }
+      finalRecipe = projectToConstraints(perturbed, bounds);
+      attempt++;
+    }
+
+    return finalRecipe;
+  };
+
+  const handleSingleRaterSubmit = () => {
+    if (!isWeightValid || !boundsStatus.valid) return; 
+    const newRoundScores = [...roundScores, { ...raters[currentRaterIndex], score: currentTotalScore }];
+    setRoundScores(newRoundScores);
+    setCurrentRaterIndex(currentRaterIndex + 1);
+    setScores({ appearance: 2.0, aroma: 4.0, taste: 4.0, aftertaste: 2.0, overall: 1.0 });
+  };
+
+  const handleNextRound = () => {
+    if (!isWeightValid || !boundsStatus.valid) return;
+
+    // 记录撤销快照
+    setUndoStack(prev => [...prev, {
+      history, iteration, currentRecipe, isConverged, maxScore, bestRecipe, spaceDistance, failCount
+    }]);
+
+    let weightedFinalScore = 0;
+    roles.forEach(role => {
+      if (role.count > 0 && role.weight > 0) {
+        const groupScores = roundScores.filter(r => r.roleId === role.id).map(r => r.score);
+        const avg = groupScores.length > 0 ? groupScores.reduce((a,b)=>a+b,0)/groupScores.length : 0;
+        weightedFinalScore += avg * (role.weight / 100); 
+      }
+    });
+    weightedFinalScore = Number(weightedFinalScore.toFixed(2));
+
+    const newRecord = { iteration, score: weightedFinalScore, recipe: [...currentRecipe], details: roundScores };
+    const newHistory = [...history, newRecord];
+    setHistory(newHistory);
+
+    let newMax = maxScore;
+    let newFailCount = failCount;
+    
+    if (weightedFinalScore > maxScore) {
+      newMax = weightedFinalScore;
+      newFailCount = 0; 
+      setBestRecipe(newRecord.recipe);
+    } else {
+      if (newHistory.length > predefinedRecipes.length) newFailCount += 1;
+    }
+    
+    if (newHistory.length <= predefinedRecipes.length && weightedFinalScore >= maxScore) {
+      setBestRecipe(newRecord.recipe);
+    }
+
+    setMaxScore(newMax);
+    setFailCount(newFailCount);
+
+    let currentSpaceDist = 100; 
+    if (newHistory.length >= predefinedRecipes.length) {
+      const sortedBest = [...newHistory].sort((a, b) => {
+        if (Math.abs(b.score - a.score) > 0.001) return b.score - a.score;
+        return b.iteration - a.iteration; 
+      }).slice(0, numWines);
+      const bestRecipes = sortedBest.map(h => h.recipe);
+      let maxDist = 0;
+      for (let i = 0; i < bestRecipes.length; i++) {
+        for (let j = i + 1; j < bestRecipes.length; j++) {
+          let distSq = 0;
+          for (let k = 0; k < numWines; k++) distSq += Math.pow(bestRecipes[i][k] - bestRecipes[j][k], 2);
+          const dist = Math.sqrt(distSq);
+          if (dist > maxDist) maxDist = dist;
+        }
+      }
+      currentSpaceDist = Number(maxDist.toFixed(2));
+      setSpaceDistance(currentSpaceDist);
+    }
+
+    const distanceThreshold = 3.5; 
+
+    if (newHistory.length > predefinedRecipes.length && currentSpaceDist < distanceThreshold) {
+      setIsConverged(true);
+    } else {
+      const nextRecipe = generateNextRecipe(newHistory, numWines, newFailCount);
+      setCurrentRecipe(nextRecipe);
+      setIteration(iteration + 1);
+      setCurrentRaterIndex(0);
+      setRoundScores([]);
+      setScores({ appearance: 2.0, aroma: 4.0, taste: 4.0, aftertaste: 2.0, overall: 1.0 });
+    }
+  };
+
+  const addRole = () => setRoles([...roles, { id: Date.now().toString(), name: '新角色', count: 1, weight: 0 }]);
+  const updateRole = (id, field, value) => setRoles(roles.map(r => r.id === id ? { ...r, [field]: value } : r));
+  const removeRole = (id) => setRoles(roles.filter(r => r.id !== id));
+
+  const inputClass = "w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-red-500 focus:border-red-500 disabled:bg-gray-100 disabled:text-gray-500 transition-colors";
+  const labelClass = "block text-sm font-medium text-gray-700 mb-1";
+
+  const getPhaseInfo = () => {
+    if (iteration <= numWines) return { title: `顶点约束摸底`, desc: "建立单一边界基准" };
+    if (iteration === numWines + 1) return { title: `中心点摸底`, desc: "探索完全等比例调配潜力" };
+    if (iteration <= predefinedRecipes.length) return { title: `边界特殊点摸底`, desc: "两两比例混合评估" };
+    return { title: `算法寻优迭代`, desc: "Nelder-Mead 智能微调逼近最优" };
+  };
+
+  const currentPhase = getPhaseInfo();
+  
+  if (!loaded) return null; // 避免 LocalStorage 加载闪烁
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-4 md:p-8 font-sans">
+      <header className="mb-8 flex flex-col md:flex-row items-start md:items-center justify-between border-b border-gray-200 pb-4 gap-4">
+        <div>
+          <h1 className="text-3xl font-bold text-gray-900 flex items-center gap-2">
+            <Wine className="h-8 w-8 text-red-800" />
+            葡萄酒多组分调配优化系统
+          </h1>
+          <p className="text-gray-500 mt-1 flex items-center gap-2">
+            基于单纯形-重心设计 & Nelder-Mead 算法的专业决策平台 
+            <span className="text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded-full flex items-center gap-1"><Save className="w-3 h-3"/> 已自动保存</span>
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button 
+            onClick={handleUndo}
+            disabled={undoStack.length === 0 && currentRaterIndex === 0}
+            className="flex items-center gap-1 px-4 py-2 bg-white border border-gray-300 rounded-lg shadow-sm hover:bg-gray-50 text-gray-700 font-medium transition disabled:opacity-40"
+          >
+            <Undo2 className="h-4 w-4" /> {currentRaterIndex > 0 ? '撤销上个打分' : '撤销上一轮'}
+          </button>
+          <button 
+            onClick={() => handleReset()}
+            className="flex items-center gap-1 px-4 py-2 bg-white border border-gray-300 rounded-lg shadow-sm hover:bg-gray-50 text-red-700 font-medium transition"
+          >
+            <RotateCcw className="h-4 w-4" /> 重置实验
+          </button>
+        </div>
+      </header>
+
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-8">
+        
+        {/* ======================= */}
+        {/* 左侧：操作控制台 */}
+        {/* ======================= */}
+        <div className="xl:col-span-5 space-y-6">
+          
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+            <h2 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2 justify-between">
+              <span className="flex items-center gap-2"><Settings className="h-5 w-5 text-red-800" /> 1. 基酒组分设置与边界约束</span>
+            </h2>
+            <div className="mb-4">
+              <label className={labelClass}>选择基酒数量 (大于3款将开启 D-Optimal 精简寻优)</label>
+              <select 
+                value={numWines} 
+                onChange={(e) => handleNumWinesChange(Number(e.target.value))}
+                disabled={iteration > 1 || isConverged}
+                className={inputClass}
+              >
+                <option value={2}>2 款基酒 (直线型空间)</option>
+                <option value={3}>3 款基酒 (三角形空间)</option>
+                <option value={4}>4 款基酒 (四面体空间)</option>
+                <option value={5}>5 款基酒 (超单纯形)</option>
+              </select>
+            </div>
+            
+            <div className="space-y-3">
+              {baseWines.map((wine, idx) => (
+                <div key={idx} className="flex flex-wrap gap-2 items-center bg-gray-50/50 p-2 rounded-lg border border-gray-100">
+                  <input 
+                    type="text" 
+                    value={wine.name}
+                    onChange={(e) => {
+                      const newWines = [...baseWines];
+                      newWines[idx].name = e.target.value;
+                      setBaseWines(newWines);
+                    }}
+                    disabled={iteration > 1 || isConverged}
+                    className={`${inputClass} flex-grow sm:flex-none w-full sm:w-24 lg:w-28 font-medium text-sm`} 
+                    placeholder={`基酒 ${idx + 1}`} 
+                  />
+                  
+                  <input 
+                    type="text" 
+                    value={wine.year}
+                    onChange={(e) => {
+                      const newWines = [...baseWines];
+                      newWines[idx].year = e.target.value;
+                      setBaseWines(newWines);
+                    }}
+                    placeholder="年份" 
+                    className={`${inputClass} flex-grow sm:flex-none w-full sm:w-24 lg:w-28 text-center text-sm`} 
+                    disabled={iteration > 1 || isConverged} 
+                    maxLength={4}
+                  />
+                  
+                  <div className={`flex gap-0.5 flex-none items-center bg-white border border-gray-300 rounded-md shadow-sm h-[38px] px-1 transition-colors ${iteration > 1 || isConverged ? 'bg-gray-100' : 'focus-within:border-red-500 focus-within:ring-1 focus-within:ring-red-500'}`}>
+                    <input 
+                      type="number" min="0" max="100"
+                      value={wine.min}
+                      onChange={(e) => {
+                        const newWines = [...baseWines];
+                        newWines[idx].min = e.target.value;
+                        setBaseWines(newWines);
+                      }}
+                      placeholder="Min" 
+                      className="w-9 sm:w-10 bg-transparent text-center text-sm outline-none placeholder-gray-400 disabled:text-gray-500" 
+                      disabled={iteration > 1 || isConverged} 
+                    />
+                    <span className="text-gray-300 text-xs">-</span>
+                    <input 
+                      type="number" min="0" max="100"
+                      value={wine.max}
+                      onChange={(e) => {
+                        const newWines = [...baseWines];
+                        newWines[idx].max = e.target.value;
+                        setBaseWines(newWines);
+                      }}
+                      placeholder="Max" 
+                      className="w-9 sm:w-10 bg-transparent text-center text-sm outline-none placeholder-gray-400 disabled:text-gray-500" 
+                      disabled={iteration > 1 || isConverged} 
+                    />
+                  </div>
+
+                  <input 
+                    type="text" 
+                    value={wine.tag}
+                    onChange={(e) => {
+                      const newWines = [...baseWines];
+                      newWines[idx].tag = e.target.value;
+                      setBaseWines(newWines);
+                    }}
+                    placeholder="特征描述 (如: 果香浓郁)" 
+                    className={`${inputClass} flex-1 min-w-[100px] text-sm`} 
+                    disabled={iteration > 1 || isConverged} 
+                  />
+                </div>
+              ))}
+            </div>
+            
+            {!boundsStatus.valid && (
+               <div className="mt-3 p-2 bg-red-50 border border-red-200 rounded text-red-700 text-xs flex items-center gap-1">
+                 <AlertCircle className="w-4 h-4"/> 
+                 约束不合理！(Min总和超100%，或Max总和低于100%，或出现 Min&gt;Max)
+               </div>
+            )}
+          </div>
+
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+            <h2 className="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2">
+              <Users className="h-5 w-5 text-red-800" /> 2. 评审团队与权重分配
+            </h2>
+            
+            <div className="space-y-3">
+              {roles.map(role => (
+                <div key={role.id} className="flex items-center gap-2 bg-gray-50 p-2 rounded-lg border border-gray-100">
+                  <input 
+                    type="text" 
+                    value={role.name} 
+                    onChange={e => updateRole(role.id, 'name', e.target.value)} 
+                    disabled={iteration > 1 || isConverged} 
+                    className={`${inputClass} w-24 sm:w-28 text-sm font-bold flex-none`} 
+                    placeholder="角色名" 
+                  />
+                  <div className="flex items-center gap-1 flex-1 sm:flex-none justify-center">
+                    <label className="text-xs text-gray-500 whitespace-nowrap">人数</label>
+                    <input 
+                      type="number" min="0" value={role.count} 
+                      onChange={e => updateRole(role.id, 'count', Number(e.target.value))} 
+                      disabled={iteration > 1 || isConverged} 
+                      className={`${inputClass} w-16 text-center text-sm`} 
+                    />
+                  </div>
+                  <div className="flex items-center gap-1 flex-1 sm:flex-none justify-center">
+                    <label className="text-xs text-gray-500 whitespace-nowrap">权重</label>
+                    <div className="flex items-center gap-1">
+                      <input 
+                        type="number" min="0" max="100" value={role.weight} 
+                        onChange={e => updateRole(role.id, 'weight', Number(e.target.value))} 
+                        disabled={iteration > 1 || isConverged} 
+                        className={`${inputClass} w-20 text-center text-sm`} 
+                      />
+                      <span className="text-gray-500 text-xs font-medium">%</span>
+                    </div>
+                  </div>
+                  <button 
+                    onClick={() => removeRole(role.id)} 
+                    disabled={iteration > 1 || isConverged || roles.length <= 1} 
+                    className="text-gray-400 hover:text-red-600 p-1 disabled:opacity-30 transition-colors ml-auto sm:ml-0"
+                  >
+                    <Trash2 className="w-5 h-5"/>
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {iteration === 1 && !isConverged && (
+              <button 
+                onClick={addRole} 
+                className="text-sm font-medium text-red-700 hover:text-red-900 flex items-center gap-1 mt-3 px-2 py-1 rounded hover:bg-red-50 transition"
+              >
+                <Plus className="w-4 h-4"/> 添加新角色
+              </button>
+            )}
+
+            <div className={`mt-4 p-3 rounded-lg flex flex-wrap items-center justify-between border transition-colors ${isWeightValid ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'}`}>
+              <span className={`text-sm font-bold ${isWeightValid ? 'text-green-700' : 'text-red-700'}`}>
+                当前有效权重总和：{activeTotalWeight}%
+              </span>
+              {!isWeightValid && (
+                <span className="text-xs text-red-600 flex items-center gap-1 mt-1 sm:mt-0 font-medium">
+                  <AlertCircle className="w-4 h-4"/> 必须等于 100%
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 relative overflow-hidden">
+            {isConverged && (
+              <div className="absolute inset-0 bg-white/80 backdrop-blur-sm z-10 flex items-center justify-center">
+                <div className="text-center">
+                  <CheckCircle className="h-12 w-12 text-green-500 mx-auto mb-2" />
+                  <p className="font-bold text-gray-800 text-lg">调配优化已结束</p>
+                  <p className="text-sm text-gray-500">空间跨度已小于阈值</p>
+                </div>
+              </div>
+            )}
+            
+            <div className="flex justify-between items-start mb-4">
+              <div>
+                <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+                  <Wine className="h-5 w-5 text-red-800" /> 
+                  3. 第 {iteration} 轮: {currentPhase.title}
+                </h2>
+                <p className="text-xs text-gray-500 mt-1 ml-7">{currentPhase.desc}</p>
+              </div>
+              {iteration > predefinedRecipes.length && !isConverged && (
+                <div className="flex flex-col items-end gap-1 text-xs text-blue-600 bg-blue-50 px-2 py-1 rounded border border-blue-100">
+                  <span className="flex items-center gap-1">
+                    <Target className="w-3 h-3"/> 当前空间跨度:
+                  </span>
+                  <span className="font-bold text-sm">{spaceDistance}</span>
+                </div>
+              )}
+            </div>
+
+            {raters.length === 0 || !boundsStatus.valid ? (
+               <div className="p-4 bg-red-50 text-red-700 rounded-lg text-sm">
+                 请确保上方“基酒边界约束”和“权重总和(100%)”设置正确无误。
+               </div>
+            ) : (
+               <>
+                 {currentRaterIndex < raters.length ? (
+                   <div className="mb-4 bg-red-50 border border-red-100 rounded-lg p-3 flex justify-between items-center transition-colors">
+                      <div>
+                        <span className="text-xs text-red-600 font-bold tracking-wider uppercase">当前录入进度</span>
+                        <p className="text-lg font-bold text-red-900 mt-0.5 flex items-center gap-2">
+                           <UserCheck className="h-5 w-5"/> 请 {raters[currentRaterIndex].name} 打分
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <span className="text-2xl font-black text-red-800">{currentRaterIndex + 1}</span>
+                        <span className="text-gray-500 font-medium"> / {raters.length}</span>
+                      </div>
+                   </div>
+                 ) : (
+                   <div className="mb-4 bg-green-50 border border-green-200 rounded-lg p-4 text-center">
+                      <p className="text-green-800 font-bold mb-1">✅ 本轮所有人已打分完毕</p>
+                      <p className="text-xs text-green-600">请点击下方按钮计算加权结果</p>
+                   </div>
+                 )}
+
+                 {currentRaterIndex < raters.length && (
+                   <div className="grid grid-cols-2 gap-4 mb-6">
+                    <div>
+                      <label className={labelClass}>外观 (0-3)</label>
+                      <input type="number" step="0.5" min="0" max="3" value={scores.appearance} onChange={e=>setScores({...scores, appearance: Number(e.target.value)})} className={inputClass} />
+                    </div>
+                    <div>
+                      <label className={labelClass}>香气 (0-6)</label>
+                      <input type="number" step="0.5" min="0" max="6" value={scores.aroma} onChange={e=>setScores({...scores, aroma: Number(e.target.value)})} className={inputClass} />
+                    </div>
+                    <div>
+                      <label className={labelClass}>口感 (0-6)</label>
+                      <input type="number" step="0.5" min="0" max="6" value={scores.taste} onChange={e=>setScores({...scores, taste: Number(e.target.value)})} className={inputClass} />
+                    </div>
+                    <div>
+                      <label className={labelClass}>余味 (0-3)</label>
+                      <input type="number" step="0.5" min="0" max="3" value={scores.aftertaste} onChange={e=>setScores({...scores, aftertaste: Number(e.target.value)})} className={inputClass} />
+                    </div>
+                    <div className="col-span-2">
+                      <label className={labelClass}>整体印象 (0-2)</label>
+                      <input type="number" step="0.5" min="0" max="2" value={scores.overall} onChange={e=>setScores({...scores, overall: Number(e.target.value)})} className={inputClass} />
+                    </div>
+                    
+                    <div className="col-span-2 mt-2 bg-gray-50 rounded-lg p-3 border flex justify-between items-center border-gray-200">
+                      <span className="text-sm font-medium text-gray-600">该评委合计分：</span>
+                      <span className="text-2xl font-black text-gray-800">{currentTotalScore.toFixed(1)}</span>
+                    </div>
+                  </div>
+                 )}
+
+                 {currentRaterIndex < raters.length ? (
+                    <button 
+                      onClick={handleSingleRaterSubmit}
+                      className="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3 px-4 rounded-lg shadow-md transition flex justify-center items-center gap-2"
+                    >
+                      录入 {raters[currentRaterIndex].name} 的分数
+                    </button>
+                 ) : (
+                    <button 
+                      onClick={handleNextRound}
+                      className="w-full bg-red-800 hover:bg-red-900 text-white font-bold py-3 px-4 rounded-lg shadow-md transition flex justify-center items-center gap-2"
+                    >
+                      计算加权分数并生成下一轮 <TrendingUp className="h-5 w-5" />
+                    </button>
+                 )}
+               </>
+            )}
+          </div>
+
+        </div>
+
+        {/* ======================= */}
+        {/* 右侧：数据可视化与结果 */}
+        {/* ======================= */}
+        <div className="xl:col-span-7 space-y-6">
+          
+          {isConverged && (
+             <div className="space-y-4">
+               <div className="bg-green-50 border-l-4 border-green-500 p-4 rounded-r-lg shadow-sm animate-pulse">
+                 <div className="flex items-center">
+                   <CheckCircle className="h-6 w-6 text-green-500 mr-3" />
+                   <div>
+                     <h3 className="text-green-800 font-bold text-lg">🎉 调配优化完成！</h3>
+                     <p className="text-green-700 text-sm mt-1">
+                       最优的多个配方之间空间距离已缩小至 <strong>3.5</strong> 以内。意味着算法已成功将调配范围收敛到极小区间，寻优结束。
+                     </p>
+                   </div>
+                 </div>
+               </div>
+             </div>
+          )}
+
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+            <h2 className="text-lg font-bold text-gray-800 mb-4 flex items-center justify-between">
+              <span className="flex items-center gap-2">
+                {isConverged ? <PieChartIcon className="h-5 w-5 text-red-800"/> : <Wine className="h-5 w-5 text-red-800"/>}
+                {isConverged ? '🏆 最佳调配方案 (车间投料指导)' : `🧪 第 ${iteration} 轮品鉴杯取样表 (ISO标准 50mL)`}
+              </span>
+              
+              {!isConverged && (
+                <div className="hidden sm:flex items-center gap-1 text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded">
+                  <Map className="w-3 h-3"/> 
+                  {iteration <= predefinedRecipes.length ? `预设摸底阶段 (${iteration}/${predefinedRecipes.length})` : '智能寻优阶段'}
+                </div>
+              )}
+            </h2>
+
+            {isConverged && (
+               <div className="mb-4 flex items-center gap-4 bg-yellow-50 p-3 rounded-lg border border-yellow-100">
+                 <label className="text-sm font-bold text-yellow-800 whitespace-nowrap">目标生产体积:</label>
+                 <div className="flex items-center gap-2 w-48">
+                    <input 
+                      type="number" 
+                      value={targetVolume} 
+                      onChange={e=>setTargetVolume(Number(e.target.value))}
+                      className={`${inputClass} border-yellow-300 focus:border-yellow-500 focus:ring-yellow-500 font-bold`} 
+                    />
+                    <span className="font-bold text-yellow-800">升 (L)</span>
+                 </div>
+               </div>
+            )}
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="bg-gray-50 border-y border-gray-200 text-gray-600 text-sm">
+                    <th className="p-3 font-medium">基酒名称</th>
+                    <th className="p-3 font-medium">调配比例 (%)</th>
+                    <th className="p-3 font-medium text-right">
+                      {isConverged ? '车间投料量 (L)' : '品鉴取样量 (mL)'}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {baseWines.map((wine, idx) => {
+                    const ratio = isConverged ? bestRecipe[idx] : currentRecipe[idx];
+                    const volume = isConverged ? (ratio / 100 * targetVolume) : (ratio / 100 * 50);
+                    return (
+                      <tr key={idx} className="hover:bg-gray-50 transition-colors">
+                        <td className="p-3 font-medium flex items-center gap-2">
+                          <div className="w-3 h-3 rounded-full" style={{backgroundColor: WINE_COLORS[idx]}}></div>
+                          {wine.name || `酒样 ${idx+1} 号`}
+                        </td>
+                        <td className="p-3 text-gray-600 font-mono">
+                          {ratio.toFixed(2)} %
+                        </td>
+                        <td className="p-3 text-right font-bold font-mono text-red-700">
+                          {volume.toFixed(2)} {isConverged ? 'L' : 'mL'}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+              <h2 className="text-sm font-bold text-gray-800 mb-4 flex items-center gap-2">
+                <TrendingUp className="h-4 w-4 text-gray-500" /> 加权综合质量提升趋势
+              </h2>
+              {history.length > 0 ? (
+                <div className="h-64 w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={history}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E5E7EB" />
+                      <XAxis dataKey="iteration" axisLine={false} tickLine={false} tick={{fill: '#6B7280', fontSize: 12}} />
+                      <YAxis domain={[0, 20]} axisLine={false} tickLine={false} tick={{fill: '#6B7280', fontSize: 12}} />
+                      <RechartsTooltip 
+                        contentStyle={{borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}}
+                        formatter={(value) => [`${value} 分`, '加权目标得分']}
+                        labelFormatter={(label) => `第 ${label} 轮`}
+                      />
+                      <Line 
+                        type="monotone" 
+                        dataKey="score" 
+                        stroke="#9E4244" 
+                        strokeWidth={3}
+                        dot={{ r: 4, strokeWidth: 2, fill: '#fff' }} 
+                        activeDot={{ r: 6, fill: '#9E4244' }}
+                        animationDuration={500}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : (
+                <div className="h-64 flex items-center justify-center border-2 border-dashed border-gray-100 rounded-lg">
+                  <p className="text-gray-400 text-sm">暂无数据，请完成第一轮打分</p>
+                </div>
+              )}
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 flex flex-col">
+               <h2 className="text-sm font-bold text-gray-800 mb-4 flex items-center gap-2">
+                <PieChartIcon className="h-4 w-4 text-gray-500" /> 
+                {isConverged ? '最终配方几何分布' : '当前配方几何分布'}
+              </h2>
+              <div className="flex-1 min-h-[250px] relative">
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie
+                      data={baseWines.map((w, i) => ({
+                        name: w.name || `酒样 ${i+1}`,
+                        value: isConverged ? bestRecipe[i] : currentRecipe[i]
+                      }))}
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={60}
+                      outerRadius={90}
+                      paddingAngle={2}
+                      dataKey="value"
+                      animationDuration={800}
+                    >
+                      {baseWines.map((entry, index) => (
+                        <Cell key={`cell-${index}`} fill={WINE_COLORS[index % WINE_COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <RechartsTooltip 
+                       formatter={(value) => `${value.toFixed(2)} %`}
+                       contentStyle={{borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}}
+                    />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                  <span className="text-gray-400 text-xs font-medium">总计</span>
+                  <span className="text-xl font-black text-gray-800">100%</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
